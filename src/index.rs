@@ -1,10 +1,10 @@
 use sha1_smol::{Digest, Sha1};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashMap, HashSet},
     fs::{self, File},
     io::{BufRead, Cursor, Read, Write},
     os::{linux::fs::MetadataExt, unix::fs::PermissionsExt},
-    path::PathBuf,
+    path::{Path, PathBuf},
 };
 
 use crate::tree::Tree;
@@ -198,6 +198,9 @@ impl IndexEntry {
 pub struct Index {
     path: PathBuf,
     entries: BTreeMap<PathBuf, IndexEntry>,
+    // This "parents_to_children" field maps each directory to all the paths (files) that it is a parent of. It's fully derived from "entries" and is used
+    // as a faster way to access a given directory's children (e.g. remove_children).
+    parents_to_children: HashMap<PathBuf, HashSet<PathBuf>>,
 }
 
 impl Index {
@@ -212,7 +215,7 @@ impl Index {
             Ok(buf) => {
                 let mut cursor = Cursor::new(buf);
                 let length = Self::read_header(&mut cursor);
-                let entries = (0..length)
+                let entries: BTreeMap<_, _> = (0..length)
                     .map(|_| {
                         let entry = IndexEntry::read_entry(&mut cursor);
                         (entry.path.clone(), entry)
@@ -232,30 +235,115 @@ impl Index {
                 let bytes_to_hash = x.fill_buf().unwrap();
                 assert!(sha == Sha1::from(bytes_to_hash).digest().bytes());
 
-                Index { path, entries }
+                // TODO consider only constructing this when it's needed (maybe using interior mutability to populate it behind the scenes when it's first needed and then reusing it on subsequent calls)
+                // Construct the parents_to_children "cache" so we can easily find the children of any given dir entry.
+                let parents_to_children = Self::construct_parents_cache(&entries);
+
+                Index {
+                    path,
+                    entries,
+                    parents_to_children,
+                }
             }
         }
+    }
+
+    fn construct_parents_cache(
+        entries: &BTreeMap<PathBuf, IndexEntry>,
+    ) -> HashMap<PathBuf, HashSet<PathBuf>> {
+        let mut parents_to_children: HashMap<PathBuf, HashSet<PathBuf>> = HashMap::new();
+        for entry_path in entries.keys() {
+            for parent_dir in Tree::get_parent_directories(entry_path) {
+                match parents_to_children.get_mut(&parent_dir) {
+                    Some(children) => {
+                        children.insert(entry_path.clone());
+                    }
+
+                    None => {
+                        let mut children = HashSet::new();
+                        children.insert(entry_path.clone());
+                        parents_to_children.insert(parent_dir, children);
+                    }
+                }
+            }
+        }
+        parents_to_children
     }
 
     pub fn get_filepaths(&self) -> Vec<&PathBuf> {
         self.entries.keys().collect()
     }
 
-    pub fn add(&mut self, path: PathBuf, oid: Digest, metadata: IndexMetadata) {
+    fn discard_conflicts(&mut self, conflicting_path: &Path) {
         // If an existing entry conflicts with this new one, remove the old entry.
-        for path in Tree::get_parent_directories(&path) {
-            self.entries.remove(&path);
+        // This handles the case when the existing entry is just a file.
+        for parent_dir in Tree::get_parent_directories(conflicting_path) {
+            self.remove_entry(&parent_dir);
         }
+        self.remove_children(conflicting_path);
+    }
 
+    fn remove_children(&mut self, path: &Path) {
+        // This handles the case when the existing entry is a directory (and we have to recursively remove its entries).
+        if let Some(children) = self.parents_to_children.get(path) {
+            println!("removing children: {}", path.display());
+            for child in children.clone() {
+                self.remove_entry(&child);
+            }
+        };
+    }
+
+    fn remove_entry(&mut self, path: &Path) {
+        // If such an entry exists,
+        if let Some(entry) = self.entries.get(path) {
+            println!("removing entry: {}", path.display());
+            let entry_path = entry.path.clone();
+            // Remove the entry from entries.
+            self.entries.remove(&entry_path);
+            // Also remove the entry from the parents_to_children field. That means go over the parent dirs of this entry,
+            // and for each such parent dir, remove its children. Finally, remove the parent dir itself.
+            for parent in Tree::get_parent_directories(&entry_path) {
+                if let Some(children) = self.parents_to_children.get_mut(&parent) {
+                    if children.is_empty() {
+                        self.parents_to_children.remove(&parent);
+                    } else {
+                        children.remove(&entry_path);
+                    }
+                }
+            }
+        };
+    }
+
+    pub fn add(&mut self, path: PathBuf, oid: Digest, metadata: IndexMetadata) {
         println!("Adding {} to index!", path.display());
-        self.entries.insert(
-            path.clone(),
-            IndexEntry {
-                path,
-                oid,
-                metadata,
-            },
-        );
+        self.discard_conflicts(&path);
+
+        self.store_entry(IndexEntry {
+            path,
+            oid,
+            metadata,
+        });
+    }
+
+    fn store_entry(&mut self, entry: IndexEntry) {
+        let entry_path = entry.path.clone();
+
+        self.entries.insert(entry_path.clone(), entry);
+
+        // TODO this whole block is repeated in construct_parents_cache(). Refactor it out by making a similar func to populate the parents_to_children for a single entry.
+        // Now populate the parents_to_children for this new entry.
+        for parent_dir in Tree::get_parent_directories(&entry_path) {
+            match self.parents_to_children.get_mut(&parent_dir) {
+                Some(children) => {
+                    children.insert(entry_path.clone());
+                }
+                None => {
+                    let mut children = HashSet::new();
+                    children.insert(entry_path.clone());
+                    self.parents_to_children.insert(parent_dir, children);
+                }
+            }
+        }
     }
 
     pub fn write_updates(&mut self) {
@@ -316,7 +404,7 @@ mod tests {
         const INDEX_PATH: &str = "some_index";
         Index {
             path: PathBuf::from(INDEX_PATH),
-            entries: Default::default(),
+            ..Default::default()
         }
     }
     #[test]
@@ -336,7 +424,7 @@ mod tests {
     }
 
     #[test]
-    fn test_add_conflicting_entries() {
+    fn test_add_discard_conflicts_file() {
         let mut index = empty_index();
         let filepaths = ["alice.txt", "bob.txt", "alice.txt/nested.txt"]
             .iter()
@@ -348,9 +436,35 @@ mod tests {
             index.add(filepath.clone(), fake_digest, IndexMetadata::default());
         }
         // There should be only two entries, because "alice.txt" was conflicting with the last one and was removed.
-        // Also, the entries are now ordered alphabetically.
+        // Also, the entries are ordered alphabetically.
         assert_eq!(index.entries.len(), 2);
         let expected_filepaths = ["alice.txt/nested.txt", "bob.txt"];
+        for (entry_key, expected_filepath) in index.entries.keys().zip(expected_filepaths) {
+            assert_eq!(entry_key.to_string_lossy(), expected_filepath);
+        }
+    }
+
+    #[test]
+    fn test_add_discard_conflicts_dir() {
+        let mut index = empty_index();
+        let filepaths = [
+            "alice.txt",
+            "nested/bob.txt",
+            "nested/inner/claire.txt",
+            "nested",
+        ]
+        .iter()
+        .map(|path| PathBuf::from(path))
+        .collect::<Vec<_>>();
+        let fake_digest = Sha1::from("").digest();
+
+        for filepath in filepaths {
+            index.add(filepath.clone(), fake_digest, IndexMetadata::default());
+        }
+        // There should be only two entries, because everything in the "nested/" dir was conflicting with the "nested" file we added most recently.
+        // Also, the entries are ordered alphabetically.
+        assert_eq!(index.entries.len(), 2);
+        let expected_filepaths = ["alice.txt", "nested"];
         for (entry_key, expected_filepath) in index.entries.keys().zip(expected_filepaths) {
             assert_eq!(entry_key.to_string_lossy(), expected_filepath);
         }
