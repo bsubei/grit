@@ -75,12 +75,15 @@ fn main() -> Result<()> {
             let mut commit_message = String::new();
             stdin().read_line(&mut commit_message)?;
 
+            // TODO currently, we can't read HEAD files that refer to branches (we assume hashes only). That means we can't test on this repo because we used git to create branches.
             let parent_ref = refs.read_head();
             let root_msg = match &parent_ref {
                 Some(_) => "",
                 _ => "(root-commit) ",
             };
 
+            // TODO only go ahead and create a commit if there is something to commit. Likely have to compare the commit's root tree hash with the parent's tree hash.
+            // TODO FIX BUG where add is adding unrelated files to the index. Might be related to above.
             // Make a Commit object and write it to disk.
             let commit = Commit::new(
                 *root_tree.get_oid(),

@@ -115,6 +115,7 @@ impl Tree {
     }
 
     pub fn new(mut blobs: Vec<Blob>) -> Self {
+        // TODO possibly don't need to sort this because these come from the index, which sorts them.
         blobs.sort();
 
         // Create a tree filled with entries.
