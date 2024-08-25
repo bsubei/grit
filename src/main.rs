@@ -16,8 +16,9 @@ use object::Object;
 use refs::Refs;
 use std::env;
 use std::fs;
-use std::io::{stdin, Result};
-use std::path::PathBuf;
+use std::io;
+use std::io::stdin;
+use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 use tree::Tree;
 use workspace::Workspace;
@@ -26,7 +27,7 @@ use workspace::Workspace;
 const AUTHOR_NAME: &str = "bsubei";
 const AUTHOR_EMAIL: &str = "6508762+bsubei@users.noreply.github.com";
 
-fn main() -> Result<()> {
+fn main() -> io::Result<()> {
     // TODO use something like clap for arg parsing.
     let args: Vec<String> = env::args().collect();
     let subcommand = args.get(1).expect("missing subcommand");
@@ -106,11 +107,15 @@ fn main() -> Result<()> {
         }
         // TODO we have to handle adding removed files (to support deleting files).
         "add" => {
-            let input_filepaths = args
+            let mut input_filepaths = args
                 .into_iter()
                 .skip(2)
                 .map(PathBuf::from)
                 .collect::<Vec<_>>();
+            // Default to adding the root path.
+            if input_filepaths.is_empty() {
+                input_filepaths.push(root_path.clone());
+            }
 
             let ws = Workspace::new(root_path);
             let mut database = Database::new(db_path);
@@ -119,24 +124,55 @@ fn main() -> Result<()> {
 
             // TODO don't try to add/write files that already exist in the index unless they have changes.
             // For every user-given filepath, expand it (walk any directories), and add every resulting filepath.
-            for input_filepath in input_filepaths {
-                for expanded_filepath in ws.list_files(&input_filepath) {
-                    let data = ws
-                        .read_file(&expanded_filepath)
-                        .expect("Could not read file in add");
-                    let fs_metadata = ws
-                        .stat_file(&expanded_filepath)
-                        .expect("Could not get file metadata");
+            let expanded_filepaths: walkdir::Result<Vec<PathBuf>> = input_filepaths
+                .iter()
+                .map(|input_filepath| ws.list_files(input_filepath))
+                .collect::<walkdir::Result<Vec<_>>>()
+                .map(|t| t.concat());
 
-                    let blob = Blob::new(data, expanded_filepath.clone());
-                    database.store(&blob);
-                    index.add(
-                        expanded_filepath,
-                        *blob.get_oid(),
-                        IndexMetadata::from(fs_metadata),
-                    );
+            match expanded_filepaths {
+                Err(e) => {
+                    let path = e.path().unwrap_or(Path::new(""));
+                    if let Some(error) = e.io_error() {
+                        match error.kind() {
+                            io::ErrorKind::NotFound => {
+                                eprintln!(
+                                    "fatal: pathspec '{}' did not match any files",
+                                    path.display()
+                                );
+                            }
+                            _ => {
+                                eprintln!(
+                                    "fatal: pathspec {} had an unknown io error",
+                                    path.display()
+                                );
+                            }
+                        }
+                    } else {
+                        eprintln!("fatal: pathspec {} had an unknown error", path.display());
+                    }
+                    std::process::exit(128);
                 }
-            }
+                Ok(expanded_filepaths) => {
+                    for expanded_filepath in expanded_filepaths {
+                        let data = ws
+                            .read_file(&expanded_filepath)
+                            .expect("Could not read file in add");
+                        let fs_metadata = ws
+                            .stat_file(&expanded_filepath)
+                            .expect("Could not get file metadata");
+
+                        let blob = Blob::new(data, expanded_filepath.clone());
+                        database.store(&blob);
+                        index.add(
+                            expanded_filepath,
+                            *blob.get_oid(),
+                            IndexMetadata::from(fs_metadata),
+                        );
+                    }
+                }
+            };
+
             index.write_updates();
         }
         _ => panic!("Unsupported subcommand: {}", subcommand),

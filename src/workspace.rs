@@ -1,5 +1,5 @@
 use std::fs::{self, Metadata};
-use std::io::Result;
+use std::io;
 use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
 
@@ -21,17 +21,17 @@ impl Workspace {
         Workspace { workspace_dir }
     }
 
-    pub fn list_files(&self, filepath: &Path) -> Vec<PathBuf> {
+    pub fn list_files(&self, filepath: &Path) -> walkdir::Result<Vec<PathBuf>> {
         let canonicalized = filepath
             .to_path_buf()
             .clone()
             .canonicalize()
-            .expect("failed to canonicalize");
+            .map_err(|err| walkdir::Error::from(err));
 
         // Swallows errors when accessing dir entries and only shows the entries we can access.
 
         // Return all entries in dir except for ignored ones. If a file is given, WalkDir yields only that file in the iterator.
-        WalkDir::new(canonicalized)
+        Ok(WalkDir::new(canonicalized)
             .into_iter()
             .filter_entry(|entry| {
                 !IGNORE.contains(
@@ -43,24 +43,24 @@ impl Workspace {
                         .as_ref(),
                 )
             })
-            .filter_map(|entry| entry.ok())
-            .filter_map(|entry| {
-                entry.file_type().is_file().then(|| {
-                    entry
-                        .path()
-                        .strip_prefix(&self.workspace_dir)
-                        .expect("failed to strip prefix from dir entry")
-                        .to_path_buf()
-                })
+            .collect::<walkdir::Result<Vec<_>>>()?
+            .iter()
+            .filter(|entry| entry.file_type().is_file())
+            .map(|entry| {
+                entry
+                    .path()
+                    .strip_prefix(&self.workspace_dir)
+                    .expect("failed to strip prefix from dir entry")
+                    .to_path_buf()
             })
-            .collect()
+            .collect())
     }
 
-    pub fn read_file<P: AsRef<Path>>(&self, filepath: P) -> Result<Vec<u8>> {
+    pub fn read_file<P: AsRef<Path>>(&self, filepath: P) -> io::Result<Vec<u8>> {
         fs::read(self.workspace_dir.join(filepath))
     }
 
-    pub fn stat_file<P: AsRef<Path>>(&self, path: P) -> Result<Metadata> {
+    pub fn stat_file<P: AsRef<Path>>(&self, path: P) -> io::Result<Metadata> {
         fs::metadata(self.workspace_dir.join(path))
     }
 }
